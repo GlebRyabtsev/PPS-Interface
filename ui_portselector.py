@@ -78,4 +78,3 @@ class Ui_PortSelector(object):
         self.connectButton.setText(QCoreApplication.translate("PortSelector", u"Verbinden", None))
         self.connectedLabel.setText(QCoreApplication.translate("PortSelector", u"Nicht verbunden", None))
     # retranslateUi
-

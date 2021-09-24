@@ -1,5 +1,6 @@
 import glob
 import threading
+from queue import SimpleQueue, Empty
 
 import serial
 import sys
@@ -8,10 +9,16 @@ import time
 from ui_portselector import Ui_PortSelector
 from ui_standardmode import Ui_StandardMode
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtWidgets import QApplication, QWidget, \
     QGridLayout, QComboBox, \
-    QVBoxLayout, QLCDNumber
+    QVBoxLayout, QLCDNumber, QMessageBox
+
+from datetime import datetime
+
+
+def timestamp(i):
+    print(str(i), " ", datetime.now().time())
 
 
 def serial_ports():
@@ -53,24 +60,23 @@ class SerialResponse:
         self._data_bytes = None
         self._data_length = None
         self._valid = True
-        self.received = False
 
     STARTING_BYTE = b'\xEE'
 
     def parse(self, b: bytes):
         # check the starting byte
-        if bytes[0] != self.STARTING_BYTE:
+        if b[0:1] != self.STARTING_BYTE:
             self._valid = False
             return
 
         # check response length
-        self._data_length = bytes[1]
+        self._data_length = int.from_bytes(b[1:2], byteorder="big", signed=False)
         if len(b) != self._data_length + 2:
             self._valid = False
             return
 
         # save data bytes
-        self._data_bytes = b[1:-1]
+        self._data_bytes = b[2:]
 
         # verify checksum
         # if self.__compute_checksum() != self._data_bytes[-1]
@@ -90,19 +96,23 @@ class SerialResponse:
 class SerialRequest:
     STARTING_BYTE = b'\xDD'
 
+    _checksum = None
+    sent = False  # indicated whether the request has been sent
+    _data_bytes: bytes = None
+
     def __init__(self, command, data_bytes: bytes, response):
         self._command = command
         self._data_bytes = data_bytes
-        self._data_length = len(data_bytes)
-        self._checksum = None
+        self._data_length = len(data_bytes).to_bytes(1, 'big')
         self.response = response
         self.__compute_checksum()
 
     def __compute_checksum(self):
-        self._checksum = 0  # todo: implement computing checksum
+        self._checksum = b'\x00'  # todo: implement computing checksum
 
     def compile(self):  # return a concatenated byte string to be send to the device
-        return b''.join([self.STARTING_BYTE, self._command, self._data_length, self._data_bytes, self._checksum])
+        compiled = b''.join([self.STARTING_BYTE, self._command, self._data_length, self._data_bytes, self._checksum])
+        return compiled
 
 
 class StandardAcknowledgement(SerialResponse):
@@ -131,7 +141,20 @@ class ReadVoltageResponse(SerialResponse):
         if self._data_length != 2:
             self._valid = False
             return
-        self.voltage = int.from_bytes(self._data_bytes, 'big', signed=False)
+        self.voltage = int.from_bytes(self._data_bytes, 'little', signed=True)
+
+
+class ReadCurrentResponse(SerialResponse):
+    def __init__(self):
+        super(ReadCurrentResponse, self).__init__()
+        self.current = None
+
+    def parse(self, b: bytes):
+        super(ReadCurrentResponse, self).parse(b)
+        if self._data_length != 2:
+            self._valid = False
+            return
+        self.current = int.from_bytes(self._data_bytes, 'little', signed=True)
 
 
 class ConnectionRequest(SerialRequest):
@@ -151,6 +174,9 @@ class SetVoltageRequest(SerialRequest):
                                                           voltage.to_bytes(2, byteorder='big', signed=False)]),
                                                 StandardAcknowledgement())
 
+    def update_value(self, voltage):
+        self._data_bytes = b''.join([self._data_bytes[0:1], voltage.to_bytes(2, byteorder='big', signed=False)])
+
 
 class ReadVoltageRequest(SerialRequest):
     __READ_VOLTAGE_REQUEST_COMMAND = b'\x02'
@@ -162,88 +188,126 @@ class ReadVoltageRequest(SerialRequest):
                                                  ReadVoltageResponse())
 
 
-class SerialConnection:
-    __TIMEOUT = 5  # timeout in seconds
+class ReadCurrentRequest(SerialRequest):
+    __READ_CURRENT_REQUEST_COMMAND = b'\x03'
 
+    def __init__(self, channel: int):
+        channel_byte = bytes([channel])
+        super(ReadCurrentRequest, self).__init__(self.__READ_CURRENT_REQUEST_COMMAND,
+                                                 channel_byte,
+                                                 ReadCurrentResponse())
+
+
+class SerialConnection(QThread):
+    __TIMEOUT = 1  # timeout in seconds
     __port = serial.Serial()
-    __current_request = None
     __timeout = True
     __connected = False
+    __connection_pending = False
+    __request_queue = SimpleQueue()
+    __serial_lock = threading.Lock()
+    __exit = False
 
-    @classmethod
-    def __listener(cls):
-        if cls.__current_request is None:
-            raise RuntimeError('No request')
-        timeout = time.time() + cls.__TIMEOUT
-        timeout_occurred = True  # separate variable since __listener can be run in a different thread
-        while time.time() < timeout:
-            if cls.__port.in_waiting == 0:
-                time.sleep(0.1)
+    connection_status_change_signal = Signal(bool)
+    read_voltage_signal_1 = Signal(ReadVoltageResponse)
+    read_voltage_signal_2 = Signal(ReadVoltageResponse)
+    read_current_signal_1 = Signal(ReadCurrentResponse)
+    read_current_signal_2 = Signal(ReadCurrentResponse)
+
+    def __init__(self, n_channels):
+        super(SerialConnection, self).__init__()
+
+    def run(self):
+        while not self.__exit:  # and (self.__connected or self.__connection_pending)
+            (request, signal) = self.__request_queue.get()
+            if request is None:
+                raise RuntimeError('No request')
+            request.sent = True
+
+            with self.__serial_lock:
+                # sending the request
+                self.__port.write(request.compile())
+
+                timeout = time.time() + self.__TIMEOUT
+                timeout_occurred = True  # separate variable since __listener can be run in a different thread
+                while time.time() < timeout:
+                    if self.__port.in_waiting == 0:
+                        time.sleep(0.1)
+                        continue
+                    current_starting_byte = self.__port.read()
+                    if current_starting_byte != SerialResponse.STARTING_BYTE:  # sth has gone wrong so flush everything
+                        self.__port.flush()
+                        self.__port.write(request.compile())
+                        continue
+                    data_length = self.__port.read()
+                    data_and_checksum = self.__port.read(int.from_bytes(data_length, "big"))
+                    # response receiving finished - flush the buffer just in case
+                    self.__port.flush()
+                    request.response.parse(
+                        b''.join([current_starting_byte, data_length, data_and_checksum]))
+                    if request.response.is_valid():
+                        timeout_occurred = False
+                        break
+                    else:
+                        self.__port.write(request.compile())
+            self.__timeout = timeout_occurred  # main timeout flag updated
+
+            if timeout_occurred:
+                self.__connected = False
+                self.connection_status_change_signal.emit(False)
                 continue
-            current_starting_byte = cls.__port.read()
-            if current_starting_byte != SerialResponse.STARTING_BYTE:  # sth has gone wrong so flush everything
-                cls.__port.flush()
-                cls.send_request(cls.__current_request)
-                continue
-            data_length = cls.__port.read()
-            data_and_checksum = cls.__port.read(data_length + 1)
-            # response receiving finished - flush the buffer just in case
-            cls.__port.flush()
-            cls.__current_request.response.parse(b''.join([current_starting_byte, data_length, data_and_checksum]))
-            if cls.__current_request.response.is_valid():
-                timeout_occurred = False
+
+            if signal is self.connection_status_change_signal:
+                if isinstance(request, ConnectionRequest):
+                    self.__connected = True
+                    self.__connection_pending = False
+                    signal.emit(True)
+                else:
+                    pass  # todo disconnect request
+            elif signal is not None:
+                signal.emit(request.response)
+
+    def send_request(self, request: SerialRequest, signal: Signal = None):
+        self.__request_queue.put((request, signal))
+
+    def connect_serial(self, port: str):
+        self.__connected = False
+        self.__connection_pending = True
+        while True:  # clear old items from the request queue
+            try:
+                self.__request_queue.get_nowait()
+            except Empty:
                 break
-            else:
-                cls.send_request(cls.__current_request)
 
-        cls.__timeout = timeout_occurred  # main timeout flag updated
-        if timeout_occurred:
-            return
+        with self.__serial_lock:  # try to open com port
+            try:
+                self.__port = serial.Serial(port)
+                self.__port.baudrate = 115200
+                self.__port.timeout = self.__TIMEOUT
+            except serial.SerialException:
+                try:
+                    self.__port.close()
+                except serial.SerialException:
+                    pass
+                self.connection_status_change_signal.emit(False)
+                return
 
-        cls.__current_request.response.received = True
+        self.send_request(ConnectionRequest(), self.connection_status_change_signal)  # send the request
 
-        cls.__current_request = None
+    def disconnect_serial(self):
+        self.__connected = False
+        with self.__serial_lock:
+            self.__port.close()
+        self.connection_status_change_signal.emit(False)
 
-    __listener_thread = threading.Thread(target=__listener)
-
-    @classmethod
-    def send_request_and_listen(cls, request: SerialRequest, synchronous=True) -> bool:
-        # sending the request
-        cls.send_request(request)
-        # start the listener process
-        cls.__port.flush()
-        cls.__listener_thread.start()
-        if synchronous:
-            cls.__listener_thread.join()
-        if cls.__timeout:
-            cls.__connected = False
-        return not cls.__timeout
-
-    @classmethod
-    def send_request(cls, request: SerialRequest):
-        cls.__port.write(request.compile())
-        cls.__current_request = request
-
-    @classmethod
-    def connect(cls, port: str) -> bool:
-        cls.__port = serial.Serial(port)
-        cls.__port.baudrate = 115200
-        cls.__port.timeout = 1
-
-        ack = StandardAcknowledgement()
-        cls.send_request_and_listen(ConnectionRequest())
-        cls.__connected = ack.get_value()
-
-        return cls.__connected
-
-    @classmethod
-    def is_connected(cls) -> bool:
-        return cls.__connected
+    def is_connected(self):
+        return self.__connected
 
 
 class PortSelector(QWidget):
+    __disconnect_pending = False
 
-    def __init__(self):
+    def __init__(self, serial_connection: SerialConnection):
         super(PortSelector, self).__init__()
         # uic.loadUi("port_selector.ui", self)
         self.ui = Ui_PortSelector()
@@ -253,17 +317,69 @@ class PortSelector(QWidget):
         self.ui.connectButton.setDisabled(True)
         self.ui.portSelectorComboBox.currentTextChanged.connect(self.port_selected)
         self.refresh_button_clicked()
+        self.serial_connection = serial_connection
+
+        self.serial_connection.connection_status_change_signal.connect(self.connection_status_changed_handler)
 
     def refresh_button_clicked(self):
         ports = serial_ports()
+        self.ui.portSelectorComboBox.clear()
         for p in ports:
             self.ui.portSelectorComboBox.addItem(p)
 
     def port_selected(self):
         self.ui.connectButton.setEnabled(True)
 
+    def __display_connection_status(self, status: str):
+        text = None
+        if status == 'not connected':
+            text = 'Nicht verbunden'
+        elif status == 'connecting':
+            text = 'Verbindung wird aufgestellt...'
+        elif status == 'connected':
+            text = 'Verbunden'
+        if text is not None:
+            self.ui.connectedLabel.setText(text)
+
+    def __display_connection_error(self):
+        mb = QMessageBox()
+        mb.setIcon(QMessageBox.Critical)
+        mb.setText("Fehler bei der Kommunikation mit dem Gerät")
+        mb.setWindowTitle("Fehler")
+        mb.setStandardButtons(QMessageBox.Ok)
+        mb.exec()
+
+    def connection_status_changed_handler(self, status: bool):
+        if status is True:
+            self.update_ui_connected()
+        else:
+            self.update_ui_disconnected()
+            if self.__disconnect_pending:
+                self.__disconnect_pending = False
+            else:  # unexpected disconnect
+                self.__display_connection_error()
+
+    def update_ui_disconnected(self):
+        self.__display_connection_status('not connected')
+        self.ui.connectButton.setEnabled(True)
+        self.ui.connectButton.setText('Verbinden')
+
+    def update_ui_connected(self):
+        self.__display_connection_status('connected')
+        self.ui.connectButton.setEnabled(True)
+        self.ui.connectButton.setText('Trennen')
+
+    def update_ui_connecting(self):
+        self.__display_connection_status('connecting')
+        self.ui.connectButton.setDisabled(True)
+
     def connect_button_clicked(self):
-        SerialConnection.connect(self.ui.portSelectorComboBox.currentText())
+        if self.serial_connection.is_connected():
+            self.__disconnect_pending = True
+            self.serial_connection.disconnect_serial()
+        else:
+            self.update_ui_connecting()
+            self.serial_connection.connect_serial(self.ui.portSelectorComboBox.currentText())
 
 
 def lcd_display(lcd: QLCDNumber, value: float):
@@ -271,7 +387,11 @@ def lcd_display(lcd: QLCDNumber, value: float):
 
 
 class StandardMode(QWidget):
-    def __init__(self, channel_number):
+    __set_voltage_req_in_queue: SetVoltageRequest = None
+    __read_voltage_req_in_queue: ReadVoltageRequest = None
+    __read_current_req_in_queue: ReadCurrentRequest = None
+
+    def __init__(self, channel_number, serial_connection: SerialConnection):
         super(StandardMode, self).__init__()
         # uic.loadUi('standard_mode.ui', self)
         self.ui = Ui_StandardMode()
@@ -286,7 +406,23 @@ class StandardMode(QWidget):
 
         self.channel_number = channel_number
 
+        self.serial_connection = serial_connection
+
+        if channel_number == 1:
+            sv = self.serial_connection.read_voltage_signal_1
+            sc = self.serial_connection.read_current_signal_1
+        else:
+            sv = self.serial_connection.read_voltage_signal_2
+            sc = self.serial_connection.read_current_signal_2
+
+        sv.connect(self.read_voltage_response_handler)
+        sc.connect(self.read_current_response_handler)
+
         self.__zero_lcds()
+
+        self.__read_values_timer = QTimer(self)
+        self.__read_values_timer.timeout.connect(self.read_values)
+        self.__read_values_timer.start(125)
 
     def dial_value_changed(self):
         val = self.ui.dial.value()
@@ -321,29 +457,43 @@ class StandardMode(QWidget):
 
     def set_voltage(self):
         lcd_display(self.ui.set_voltage_lcd, self.target_voltage / 1000.0)
-        if self.ui.change_voltage_check_box.isChecked() and SerialConnection.is_connected():
-            req = SetVoltageRequest(self.target_voltage, self.channel_number)
-            success = SerialConnection.send_request_and_listen(req)
-            # todo: async call better?
+        if self.serial_connection.is_connected():  # self.ui.change_voltage_check_box.isChecked() and
+            if self.__set_voltage_req_in_queue is not None and not self.__set_voltage_req_in_queue.sent:
+                self.__set_voltage_req_in_queue.update_value(self.target_voltage)
+            else:
+                self.__set_voltage_req_in_queue = SetVoltageRequest(self.target_voltage, self.channel_number - 1)
+                self.serial_connection.send_request(self.__set_voltage_req_in_queue)
 
-    def read_voltage(self):
-        if not SerialConnection.is_connected():
+    def read_values(self):
+        if not self.serial_connection.is_connected():
             return
-        req = ReadVoltageRequest(self.channel_number)
-        success = SerialConnection.send_request_and_listen(req)
-        if success:
-            lcd_display(self.ui.real_voltage_lcd, req.response.voltage / 1000.0)
+        if self.channel_number == 1:
+            sv = self.serial_connection.read_voltage_signal_1
+            sc = self.serial_connection.read_current_signal_1
         else:
-            pass  # todo: handle this
+            sv = self.serial_connection.read_voltage_signal_2
+            sc = self.serial_connection.read_current_signal_2
+        if self.__read_voltage_req_in_queue is None or self.__read_voltage_req_in_queue.sent:
+            self.__read_voltage_req_in_queue = ReadVoltageRequest(self.channel_number - 1)
+            self.serial_connection.send_request(self.__read_voltage_req_in_queue, sv)
+        if self.__read_current_req_in_queue is None or self.__read_current_req_in_queue.sent:
+            self.__read_current_req_in_queue = ReadCurrentRequest(self.channel_number - 1)
+            self.serial_connection.send_request(self.__read_current_req_in_queue, sc)
 
     def __zero_lcds(self):
         lcd_display(self.ui.set_voltage_lcd, 0.0)
         lcd_display(self.ui.real_voltage_lcd, 0.0)
         lcd_display(self.ui.current_lcd, 0.0)
 
+    def read_voltage_response_handler(self, r: ReadVoltageResponse):
+        lcd_display(self.ui.real_voltage_lcd, r.voltage / 1000.0)
+
+    def read_current_response_handler(self, r: ReadCurrentResponse):
+        lcd_display(self.ui.current_lcd, r.current / 1000.0)
+
 
 class Channel(QWidget):
-    def __init__(self, channel_number: int, *args, **kwargs):
+    def __init__(self, channel_number: int, serial_connection: SerialConnection, *args, **kwargs):
         super(Channel, self).__init__(*args, **kwargs)
         self.vbox_layout = QVBoxLayout()
         self.setLayout(self.vbox_layout)
@@ -352,7 +502,9 @@ class Channel(QWidget):
 
         self.channel_number = channel_number
 
-        self.standard_mode = StandardMode(channel_number)
+        self.serial_connection = serial_connection
+
+        self.standard_mode = StandardMode(channel_number, serial_connection)
 
         self.modes = {
             'Standard': self.load_standard_mode,
@@ -365,7 +517,7 @@ class Channel(QWidget):
         self.load_standard_mode()
 
     def load_standard_mode(self):
-        #self.standard_mode.__init__(self.channel_number)
+        # self.standard_mode.__init__(self.channel_number)
         self.vbox_layout.insertWidget(1, self.standard_mode)
 
     def load_pwm_mode(self):
@@ -373,6 +525,7 @@ class Channel(QWidget):
 
 
 class MainWindow(QWidget):
+    serial_connection = SerialConnection(2)
 
     def __init__(self, n_channels, *args, **kwargs):
         super(MainWindow, self).__init__(*args, **kwargs)
@@ -380,13 +533,15 @@ class MainWindow(QWidget):
         self.setWindowTitle("Spannungsquelle")
         self.grid = QGridLayout()
         self.setLayout(self.grid)
-        self.port_selector = PortSelector()
-        self.grid.addWidget(self.port_selector, 0, 0, 0, n_channels, Qt.AlignTop)
+        self.port_selector = PortSelector(self.serial_connection)
+        self.grid.addWidget(self.port_selector, 0, 0, 1, n_channels, Qt.AlignTop)
         self.channels = []
-        for ch in range(1, n_channels+1):
-            print("Main window for loop, channel " + str(ch))
-            self.channels.append(Channel(ch))
-            self.grid.addWidget(self.channels[ch-1], 1, ch-1)
+        for ch in range(1, n_channels + 1):
+            self.channels.append(Channel(ch, self.serial_connection))
+            self.grid.addWidget(self.channels[ch - 1], 1, ch - 1)
+
+        self.setFixedSize(self.grid.sizeHint())
+        self.serial_connection.start()
 
 
 app = QApplication(sys.argv)
